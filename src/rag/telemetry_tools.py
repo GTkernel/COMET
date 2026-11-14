@@ -1,276 +1,147 @@
+"""Read bounded telemetry windows for packets and RAG, excluding annotations."""
 from __future__ import annotations
 
+import math
 import json
 from pathlib import Path
 from typing import Any
 
-from src.db import get_anomaly, get_connection, get_dataset, init_db, table_exists
+from src.db import get_anomaly, init_db
+
+MAX_WINDOW_ROWS = 10000
 
 
-def get_raw_window(
-    dataset_id: int,
-    start_row_id: int,
-    end_row_id: int,
-    *,
-    db_path: str | Path | None = None,
-) -> list[dict[str, Any]] | dict[str, str]:
-    validation = _validate_window_request(
-        dataset_id,
-        start_row_id,
-        end_row_id,
-        f"raw_dataset_{dataset_id}",
-        db_path=db_path,
-    )
-    if validation.get("error"):
-        return validation
-    return _select_window(f"raw_dataset_{dataset_id}", dataset_id, start_row_id, end_row_id, db_path=db_path)
+def get_raw_window(dataset_id: int, start_row_id: int, end_row_id: int, *,
+                   db_path: str | Path | None = None) -> list[dict[str, Any]] | dict[str, str]:
+    from src.ingestion.store import read_window
+
+    if any(type(value) is not int or value <= 0 for value in (dataset_id, start_row_id, end_row_id)):
+        return _error("invalid_row_range", "Dataset and row IDs must be positive integers.")
+    if not 0 <= end_row_id - start_row_id < MAX_WINDOW_ROWS:
+        return _error("invalid_row_range", f"Select an ordered range of at most {MAX_WINDOW_ROWS} rows.")
+    try:
+        return read_window(dataset_id, start_row_id, end_row_id, db_path=db_path)
+    except ValueError as exc:
+        return _error("invalid_dataset", str(exc))
 
 
-def get_context_window(
-    dataset_id: int,
-    start_row_id: int,
-    end_row_id: int,
-    *,
-    db_path: str | Path | None = None,
-) -> list[dict[str, Any]] | dict[str, str]:
-    validation = _validate_window_request(
-        dataset_id,
-        start_row_id,
-        end_row_id,
-        f"context_ready_dataset_{dataset_id}",
-        db_path=db_path,
-    )
-    if validation.get("error"):
-        return validation
-    return _select_window(
-        f"context_ready_dataset_{dataset_id}",
-        dataset_id,
-        start_row_id,
-        end_row_id,
-        db_path=db_path,
-    )
+def get_context_window(dataset_id: int, start_row_id: int, end_row_id: int, *,
+                       db_path: str | Path | None = None) -> list[dict[str, Any]] | dict[str, str]:
+    from src.ingestion.store import load_dataset
 
-
-def get_column_summary(
-    dataset_id: int,
-    column_name: str,
-    start_row_id: int,
-    end_row_id: int,
-    *,
-    db_path: str | Path | None = None,
-) -> dict[str, Any]:
-    table_name = f"model_ready_dataset_{dataset_id}"
-    validation = _validate_window_request(
-        dataset_id,
-        start_row_id,
-        end_row_id,
-        table_name,
-        db_path=db_path,
-    )
-    if validation.get("error"):
-        return validation
-    column_validation = _validate_column(table_name, column_name, db_path=db_path)
-    if column_validation.get("error"):
-        return column_validation
-
-    rows = _select_window(table_name, dataset_id, start_row_id, end_row_id, db_path=db_path)
+    rows = get_raw_window(dataset_id, start_row_id, end_row_id, db_path=db_path)
     if isinstance(rows, dict):
-        return rows
+        if rows.get("error") != "invalid_dataset":
+            return rows
+        prepared = _prepared_window(dataset_id, start_row_id, end_row_id, context=True, db_path=db_path)
+        return prepared if prepared is not None else rows
+    dataset = load_dataset(dataset_id, db_path=db_path)
+    names = {"row_id", "timestamp", "timestamp_ns", "entity_id"}
+    names.update(column["name"] for column in dataset["columns"] if column["role"] in {"context", "categorical"})
+    return [{name: value for name, value in row.items() if name in names} for row in rows]
 
+
+def get_column_summary(dataset_id: int, column_name: str, start_row_id: int, end_row_id: int, *,
+                       db_path: str | Path | None = None) -> dict[str, Any]:
+    from src.ingestion.store import load_dataset
+
+    prepared_only = False
+    rows = get_raw_window(dataset_id, start_row_id, end_row_id, db_path=db_path)
+    if isinstance(rows, dict):
+        if rows.get("error") != "invalid_dataset":
+            return rows
+        prepared = _prepared_window(dataset_id, start_row_id, end_row_id, context=False, db_path=db_path)
+        if prepared is None or not prepared or column_name not in prepared[0]:
+            return rows
+        rows = prepared
+        prepared_only = True
+    dataset = load_dataset(dataset_id, db_path=db_path)
+    column = next((item for item in dataset["columns"] if item["name"] == column_name and item["role"] == "numeric"), None)
+    if column is None and prepared_only and dataset["storage_version"] == 1 and rows and column_name in rows[0]:
+        # A prepared-only historical catalog may have no raw column metadata.
+        from src.ingestion.store import _quote
+        from src.db import get_connection
+        with get_connection(db_path) as conn:
+            numeric = {r["name"] for r in conn.execute(f"PRAGMA table_info({_quote(f'model_ready_dataset_{dataset_id}')})")
+                       if r["type"].upper() in {"REAL", "INTEGER", "NUMERIC", "FLOAT", "DOUBLE"}}
+        if column_name in numeric and column_name not in {"row_id", "dataset_id"}:
+            column = {"value_space": "legacy_prepared", "unit": None}
+    if column is None:
+        # Prepared one-hot features are queryable alongside numeric values in original units.
+        from src.ingestion.manifest import is_label
+        from src.db import get_connection, table_exists
+        categorical = [c for c in dataset["columns"] if c["role"] == "categorical"]
+        if dataset["storage_version"] != 1 or is_label(column_name) or not any(
+                column_name.startswith(c["name"] + "__") for c in categorical):
+            return _error("unknown_column", "Select a numeric telemetry column. Annotations are excluded.")
+        from src.ingestion.store import _quote
+        table = f"model_ready_dataset_{dataset_id}"
+        with get_connection(db_path) as conn:
+            if not table_exists(conn, table) or column_name not in {r["name"] for r in conn.execute(f"PRAGMA table_info({_quote(table)})")}:
+                return _error("unknown_column", "Prepared feature does not exist.")
+            rows = [dict(r) for r in conn.execute(f"SELECT {_quote(column_name)} FROM {_quote(table)} WHERE row_id BETWEEN ? AND ? ORDER BY row_id", (start_row_id, end_row_id))]
+        column = {"value_space": "one_hot"}
     values = [_to_float(row.get(column_name)) for row in rows]
     present = [value for value in values if value is not None]
-    if not present:
-        return {
-            "dataset_id": dataset_id,
-            "column_name": column_name,
-            "start_row_id": start_row_id,
-            "end_row_id": end_row_id,
-            "count": len(values),
-            "missing_count": len(values),
-            "min": None,
-            "max": None,
-            "mean": None,
-            "first": None,
-            "last": None,
-            "delta": None,
-        }
-
-    first = next((value for value in values if value is not None), None)
-    last = next((value for value in reversed(values) if value is not None), None)
-    return {
-        "dataset_id": dataset_id,
-        "column_name": column_name,
-        "start_row_id": start_row_id,
-        "end_row_id": end_row_id,
-        "count": len(values),
-        "missing_count": len(values) - len(present),
-        "min": min(present),
-        "max": max(present),
-        "mean": sum(present) / len(present),
-        "first": first,
-        "last": last,
-        "delta": None if first is None or last is None else last - first,
-    }
+    first, last = (present[0], present[-1]) if present else (None, None)
+    return {"dataset_id": dataset_id, "column_name": column_name, "unit": column.get("unit"),
+            "value_space": column.get("value_space", "original"),
+            "start_row_id": start_row_id, "end_row_id": end_row_id,
+            "count": len(values), "missing_count": len(values) - len(present),
+            "min": min(present) if present else None, "max": max(present) if present else None,
+            "mean": sum(present) / len(present) if present else None, "first": first, "last": last,
+            "delta": last - first if present else None}
 
 
-def get_rows_around_peak(
-    dataset_id: int,
-    anomaly_id: str,
-    *,
-    radius: int = 2,
-    db_path: str | Path | None = None,
-) -> list[dict[str, Any]] | dict[str, str]:
+def _prepared_window(dataset_id, start_row_id, end_row_id, *, context, db_path):
+    """Read bounded historical context/features when their raw source is absent."""
+    from src.db import get_connection, table_exists
+    from src.ingestion.store import load_dataset, _quote
+    from src.ingestion.manifest import is_label
+    dataset = load_dataset(dataset_id, db_path=db_path)
+    if dataset["storage_version"] != 1:
+        return None
+    table = f"{'context' if context else 'model'}_ready_dataset_{dataset_id}"
+    with get_connection(db_path) as conn:
+        if not table_exists(conn, table):
+            return None
+        blocked = {r["name"] for r in conn.execute(
+            "SELECT COALESCE(sanitized_name,column_name) AS name FROM dataset_columns WHERE dataset_id=? AND role IN ('label','annotation','excluded')", (dataset_id,))}
+        names = [r["name"] for r in conn.execute(f"PRAGMA table_info({_quote(table)})")
+                 if not is_label(r["name"]) and not any(
+                     r["name"] == name or r["name"].startswith(name + "__") for name in blocked if name)]
+        if not names:
+            return None
+        return [dict(r) for r in conn.execute(f"SELECT {','.join(map(_quote, names))} FROM {_quote(table)} WHERE dataset_id=? AND row_id BETWEEN ? AND ? ORDER BY row_id",
+                                               (dataset_id, start_row_id, end_row_id))]
+
+
+def get_rows_around_peak(dataset_id: int, anomaly_id: str, *, radius: int = 2,
+                         db_path: str | Path | None = None) -> list[dict[str, Any]] | dict[str, str]:
     init_db(db_path)
-    if not _valid_positive_int(dataset_id):
-        return _error("invalid_dataset_id", "dataset_id must be a positive integer.")
-    if not isinstance(anomaly_id, str) or not anomaly_id.strip():
-        return _error("invalid_anomaly_id", "anomaly_id must be a non-empty string.")
-    if radius < 0:
-        return _error("invalid_radius", "radius must be non-negative.")
-    if get_dataset(dataset_id, db_path=db_path) is None:
-        return _error("dataset_not_found", f"Dataset {dataset_id} does not exist.")
-
+    if type(radius) is not int or not 0 <= radius < MAX_WINDOW_ROWS // 2:
+        return _error("invalid_radius", "Radius must be a nonnegative integer below 5000.")
     anomaly = get_anomaly(anomaly_id, db_path=db_path)
-    if anomaly is None:
-        return _error("anomaly_not_found", f"Anomaly {anomaly_id} does not exist.")
-    if int(anomaly["dataset_id"]) != dataset_id:
-        return _error(
-            "dataset_mismatch",
-            f"Anomaly {anomaly_id} belongs to dataset {anomaly['dataset_id']}, not {dataset_id}.",
-        )
-
-    packet = _json_dict(anomaly["packet_json"])
-    peak_row_id = _peak_row_from_packet(packet)
-    if peak_row_id is None:
-        peak_row_id = (int(anomaly["start_row_id"]) + int(anomaly["end_row_id"])) // 2
-
-    start_row_id = max(1, peak_row_id - radius)
-    end_row_id = peak_row_id + radius
-    validation = _validate_window_request(
-        dataset_id,
-        start_row_id,
-        end_row_id,
-        f"context_ready_dataset_{dataset_id}",
-        db_path=db_path,
-    )
-    if validation.get("error"):
-        return validation
-    return _select_window(
-        f"context_ready_dataset_{dataset_id}",
-        dataset_id,
-        start_row_id,
-        end_row_id,
-        db_path=db_path,
-    )
-
-
-def _validate_window_request(
-    dataset_id: int,
-    start_row_id: int,
-    end_row_id: int,
-    table_name: str,
-    *,
-    db_path: str | Path | None,
-) -> dict[str, str]:
-    init_db(db_path)
-    if not _valid_positive_int(dataset_id):
-        return _error("invalid_dataset_id", "dataset_id must be a positive integer.")
-    if not _valid_positive_int(start_row_id) or not _valid_positive_int(end_row_id):
-        return _error("invalid_row_range", "row IDs must be positive integers.")
-    if start_row_id > end_row_id:
-        return _error("invalid_row_range", "start_row_id must be <= end_row_id.")
-    if get_dataset(dataset_id, db_path=db_path) is None:
-        return _error("dataset_not_found", f"Dataset {dataset_id} does not exist.")
-    with get_connection(db_path) as conn:
-        if not table_exists(conn, table_name):
-            return _error("table_not_found", f"Required table {table_name} does not exist.")
-    return {}
-
-
-def _validate_column(
-    table_name: str,
-    column_name: str,
-    *,
-    db_path: str | Path | None,
-) -> dict[str, str]:
-    if not isinstance(column_name, str) or not column_name.strip():
-        return _error("invalid_column", "column_name must be a non-empty string.")
-    with get_connection(db_path) as conn:
-        columns = {
-            row["name"]
-            for row in conn.execute(f"PRAGMA table_info({_quote_identifier(table_name)})").fetchall()
-        }
-    if column_name not in columns:
-        return _error("unknown_column", f"Column {column_name} does not exist in {table_name}.")
-    return {}
-
-
-def _select_window(
-    table_name: str,
-    dataset_id: int,
-    start_row_id: int,
-    end_row_id: int,
-    *,
-    db_path: str | Path | None,
-) -> list[dict[str, Any]] | dict[str, str]:
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            f"""
-            SELECT *
-            FROM {_quote_identifier(table_name)}
-            WHERE dataset_id = ?
-              AND row_id BETWEEN ? AND ?
-            ORDER BY row_id
-            """,
-            (dataset_id, start_row_id, end_row_id),
-        ).fetchall()
-    return [_json_ready_row(dict(row)) for row in rows]
-
-
-def _peak_row_from_packet(packet: dict[str, Any]) -> int | None:
-    for key in ("peak_row_id", "peak_row"):
-        value = packet.get(key)
-        if _valid_positive_int(value):
-            return int(value)
-    return None
-
-
-def _valid_positive_int(value: Any) -> bool:
-    return isinstance(value, int) and value > 0
-
-
-def _error(code: str, message: str) -> dict[str, str]:
-    return {"error": code, "message": message}
-
-
-def _json_dict(payload: str | None) -> dict[str, Any]:
-    if not payload:
-        return {}
+    if anomaly is None or int(anomaly["dataset_id"]) != dataset_id:
+        return _error("anomaly_not_found", "No anomaly matches this target dataset.")
     try:
-        parsed = json.loads(payload)
-    except json.JSONDecodeError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _json_ready_row(row: dict[str, Any]) -> dict[str, Any]:
-    return {key: _json_ready_value(value) for key, value in row.items()}
-
-
-def _json_ready_value(value: Any) -> Any:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value
+        packet = json.loads(anomaly.get("packet_json") or "{}")
+    except (TypeError, ValueError):
+        packet = {}
+    peak = next((packet.get(key) for key in ("peak_row_id", "peak_row")
+                 if isinstance(packet, dict) and type(packet.get(key)) is int and packet[key] > 0), None)
+    row_id = peak or (int(anomaly["end_row_id"]) if anomaly.get("score_timestamp") else
+                      (int(anomaly["start_row_id"]) + int(anomaly["end_row_id"])) // 2)
+    return get_context_window(dataset_id, max(1, row_id - radius), row_id + radius, db_path=db_path)
 
 
 def _to_float(value: Any) -> float | None:
-    if value is None:
-        return None
     try:
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
 
 
-def _quote_identifier(identifier: str) -> str:
-    return '"' + identifier.replace('"', '""') + '"'
+def _error(code: str, message: str) -> dict[str, str]:
+    return {"error": code, "message": message}

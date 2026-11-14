@@ -1,8 +1,5 @@
 # config/model_configs
 
-Model training configuration files.
+Edit `default.yaml` to set the LSTM window size and stride, hidden size, number of layers, epochs, batch size, learning rate, and anomaly threshold percentile.
 
-Overview:
-- `default.yaml`: change the LSTM window size, stride, hidden size, number of layers, epochs, batch size, learning rate, or anomaly threshold percentile.
-
-If needed, you can use another file by passing `--config path/to/config.yaml` to `python -m src.cli train`.
+To use another file, pass `--config path/to/config.yaml` to `python -m src.cli train`.

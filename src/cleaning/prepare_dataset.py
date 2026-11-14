@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 import logging
 import math
 import re
@@ -35,6 +36,21 @@ def prepare_dataset(
     if dataset is None:
         raise ValueError(f"Dataset {dataset_id} does not exist.")
 
+    if json.loads(dataset["metadata_json"] or "{}").get("storage_version") == 2:
+        from src.ingestion.store import set_feature_roles
+        path = resolve_feature_config_path(dataset_id, feature_config, generated_config_dir=generated_config_dir)
+        columns = None
+        proposed = None
+        if feature_config is not None or path.exists():
+            config = _load_feature_config(dataset_id, path, db_path=db_path)
+            columns = _config_columns(config)
+            proposed = set_feature_roles(dataset_id, columns, db_path=db_path, validate_only=True)
+        from src.modeling.pipeline import prepare
+        result = prepare(dataset_id, db_path=db_path, _dataset=proposed)
+        if columns is not None:
+            set_feature_roles(dataset_id, columns, db_path=db_path)
+        return {**result, "config_path": str(path) if columns is not None else None}
+
     config_path = resolve_feature_config_path(dataset_id, feature_config, generated_config_dir=generated_config_dir)
     if feature_config is None and not config_path.exists():
         raise ValueError(f"Feature config for dataset {dataset_id} not found. Run profiling first.")
@@ -42,6 +58,8 @@ def prepare_dataset(
     config = _load_feature_config(dataset_id, config_path, db_path=db_path)
     _warn_if_config_dataset_mismatch(dataset_id, config, config_path, logger)
     columns = _config_columns(config)
+    from src.ingestion.store import set_feature_roles
+    set_feature_roles(dataset_id, columns, db_path=db_path, validate_only=True)
     raw_table = str(config.get("raw_table") or f"raw_dataset_{dataset_id}")
     model_table = f"model_ready_dataset_{dataset_id}"
     context_table = f"context_ready_dataset_{dataset_id}"
@@ -92,23 +110,16 @@ def prepare_dataset(
         if column["role"] == "excluded":
             logger.info("Excluded column dropped: %s", column["sanitized_name"])
 
-    _write_model_ready_table(
-        dataset_id=dataset_id,
-        table_name=model_table,
-        raw_rows=raw_rows,
-        timestamps=timestamps,
-        numeric_features=numeric_features,
-        categorical_features=categorical_features,
-        db_path=db_path,
-    )
-    _write_context_ready_table(
-        dataset_id=dataset_id,
-        table_name=context_table,
-        raw_rows=raw_rows,
-        timestamps=timestamps,
-        context_columns=context_columns,
-        db_path=db_path,
-    )
+    with get_connection(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _write_model_ready_table(
+            dataset_id=dataset_id, table_name=model_table, raw_rows=raw_rows,
+            timestamps=timestamps, numeric_features=numeric_features,
+            categorical_features=categorical_features, db_path=db_path, connection=conn)
+        _write_context_ready_table(
+            dataset_id=dataset_id, table_name=context_table, raw_rows=raw_rows,
+            timestamps=timestamps, context_columns=context_columns, db_path=db_path, connection=conn)
+        set_feature_roles(dataset_id, columns, db_path=db_path, connection=conn)
 
     logger.info(
         "Prepared dataset_id=%s model_table=%s context_table=%s rows=%s",
@@ -118,6 +129,7 @@ def prepare_dataset(
         len(raw_rows),
     )
     return {
+        "config_path": str(config_path),
         "dataset_id": dataset_id,
         "model_table": model_table,
         "context_table": context_table,
@@ -172,7 +184,7 @@ def _load_feature_config(
 ) -> dict[str, Any]:
     if feature_config_path.exists():
         text = feature_config_path.read_text(encoding="utf-8")
-        parsed = _parse_feature_config_text(text)
+        parsed = yaml.safe_load(text) or {}
         if parsed.get("columns"):
             return parsed
 
@@ -183,69 +195,6 @@ def _load_feature_config(
         return json.loads(stored["config_json"])
 
     raise ValueError(f"Feature config not found or unreadable: {feature_config_path}")
-
-
-def _parse_feature_config_text(text: str) -> dict[str, Any]:
-    if yaml is not None:
-        return yaml.safe_load(text) or {}
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return _parse_generated_yaml_subset(text)
-
-
-def _parse_generated_yaml_subset(text: str) -> dict[str, Any]:
-    parsed: dict[str, Any] = {"columns": []}
-    current_column: dict[str, Any] | None = None
-    in_columns = False
-
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if not line.startswith(" ") and ":" in stripped:
-            key, value = stripped.split(":", 1)
-            if key == "columns":
-                in_columns = True
-                continue
-            in_columns = False
-            parsed[key] = _parse_scalar(value.strip())
-            continue
-        if not in_columns:
-            continue
-        if stripped == "-":
-            current_column = {}
-            parsed["columns"].append(current_column)
-            continue
-        if current_column is not None and ":" in stripped and not stripped.startswith("- "):
-            key, value = stripped.split(":", 1)
-            if key in {
-                "column_name",
-                "sanitized_name",
-                "inferred_type",
-                "role",
-                "missing_ratio",
-                "unique_count",
-                "unique_ratio",
-                "reasoning",
-            }:
-                current_column[key] = _parse_scalar(value.strip())
-    return parsed
-
-
-def _parse_scalar(value: str) -> Any:
-    if value == "":
-        return None
-    if value in {"null", "None"}:
-        return None
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        return value[1:-1]
-    try:
-        if "." in value:
-            return float(value)
-        return int(value)
-    except ValueError:
-        return value
 
 
 def _config_columns(config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -371,6 +320,7 @@ def _write_model_ready_table(
     numeric_features: dict[str, list[float]],
     categorical_features: dict[str, dict[str, list[int]]],
     db_path: str | Path | None,
+    connection=None,
 ) -> None:
     feature_columns: list[tuple[str, str]] = []
     if timestamps is not None:
@@ -404,11 +354,10 @@ def _write_model_ready_table(
                 output.append(encoded_values[row_index])
         output_rows.append(output)
 
-    with get_connection(db_path) as conn:
+    with nullcontext(connection) if connection is not None else get_connection(db_path) as conn:
         conn.execute(f"DROP TABLE IF EXISTS {_quote_identifier(table_name)}")
         conn.execute(f"CREATE TABLE {_quote_identifier(table_name)} ({column_sql})")
         conn.executemany(insert_sql, output_rows)
-        conn.commit()
 
 
 def _write_context_ready_table(
@@ -419,6 +368,7 @@ def _write_context_ready_table(
     timestamps: list[str] | None,
     context_columns: list[dict[str, Any]],
     db_path: str | Path | None,
+    connection=None,
 ) -> None:
     context_column_names = [
         column["sanitized_name"]
@@ -451,11 +401,10 @@ def _write_context_ready_table(
         output.extend(raw_row.get(column) for column in context_column_names)
         output_rows.append(output)
 
-    with get_connection(db_path) as conn:
+    with nullcontext(connection) if connection is not None else get_connection(db_path) as conn:
         conn.execute(f"DROP TABLE IF EXISTS {_quote_identifier(table_name)}")
         conn.execute(f"CREATE TABLE {_quote_identifier(table_name)} ({', '.join(column_defs)})")
         conn.executemany(insert_sql, output_rows)
-        conn.commit()
 
 
 def _build_logger(logs_dir: Path) -> logging.Logger:

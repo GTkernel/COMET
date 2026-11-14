@@ -1,4 +1,3 @@
 # config/prompt_templates
 
-Overview:
-- `default.txt`: change how COMET asks the local LLM to summarize an anomaly, use retrieved mission documents, and recommend next actions.
+`default.txt` retains the original diagnosis template interface. Current diagnosis builds its evidence-selection prompt in Python and renders six fixed report sections. Editing this file cannot bypass evidence validation or change the report format.

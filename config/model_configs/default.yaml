@@ -4,12 +4,10 @@ window_size: 60
 
 # Step size between consecutive windows. Smaller values create more overlapping
 # windows and better coverage, but training and diagnostics run slower.
-stride: 20
+stride: 1
 
-# Fraction of generated windows used for training. Despite the name, this is
-# currently a train fraction, not a conventional train/test split. For example,
-# 0.2 trains on the first 20 percent of windows.
-train_test_split: 0.2
+# Chronological partitions are chosen in the dataset manifest before fitting.
+# Generic default: 70% training, 15% validation, 15% test rows per entity.
 
 # LSTM hidden dimension. Larger values can model more complex behavior but train
 # slower and may overfit during quick experiments.
@@ -31,7 +29,20 @@ batch_size: 128
 # lower values are steadier but slower.
 learning_rate: 0.001
 
-# Percentile of training reconstruction errors used as the anomaly threshold.
-# 95 means roughly the highest 5 percent of training-window errors define the
-# high-error tail.
+# Percentile of validation reconstruction errors used as the anomaly threshold.
 threshold_percentile: 95
+
+seed: 0
+max_categories: 64
+
+# standard keeps z-scores; asinh compresses extremes without clipping them.
+# The encoding and training mean/scale are saved with each new model.
+numeric_transform: standard
+
+# Ordinary training rejects selected features with no usable training values.
+# observed_training explicitly excludes them and records each excluded feature.
+feature_eligibility: require_all
+
+# Operational monitoring enables a first-sample reference for numeric windows.
+# Keep false for the original fixed-baseline workflow and legacy comparisons.
+window_centering: false

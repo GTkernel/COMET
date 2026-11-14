@@ -1,8 +1,3 @@
 # src/rag
 
-RAG document and diagnosis code.
-
-Overview:
-- `document_ingestion.py`: indexes mission documents
-- `diagnosis.py`: uses retrieved context to diagnose an anomaly
-- `telemetry_tools.py`: provides controlled telemetry lookups used during diagnosis
+`document_ingestion.py` indexes mission documents. `semantic.py` retrieves excerpts, and `diagnosis.py` asks the local model to select evidence. `evidence.py` validates those selections and renders the report. Python reads telemetry through `telemetry_tools.py` before inference. Annotation labels stay out of telemetry context and prompts.

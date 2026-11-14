@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "layout": "long",
+  "timestamp": "time",
+  "epoch_unit": "ms",
+  "entity_columns": ["device"],
+  "channel_column": "channel",
+  "value_column": "value",
+  "duplicate_policy": "error",
+  "max_gap_seconds": 60
+}

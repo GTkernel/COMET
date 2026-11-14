@@ -26,6 +26,7 @@ def run_model_diagnostics(
     *,
     db_path: str | Path | None = None,
     output_dir: str | Path = DIAGNOSTICS_DIR,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Score model-ready windows and save diagnostic statistics and plots."""
     init_db(db_path)
@@ -37,6 +38,13 @@ def run_model_diagnostics(
     model_row = get_model(model_id, db_path=db_path)
     if model_row is None:
         raise ValueError(f"Model metadata for model {model_id} not found.")
+    from src.db import get_detection_run
+    from src.modeling.pipeline import diagnostics
+    run = get_detection_run(run_id, dataset_id=dataset_id, model_id=model_id, db_path=db_path)
+    if run is not None:
+        return diagnostics(run["run_id"], db_path=db_path, output_dir=output_dir)
+    if run_id is not None or _json_dict(model_row["metadata_json"]).get("pipeline_version") == 2:
+        raise ValueError("Model diagnostics require a completed detection run for this target dataset and model.")
     if int(model_row["dataset_id"]) != dataset_id:
         raise ValueError(f"Model {model_id} was trained for dataset {model_row['dataset_id']}, not {dataset_id}.")
 
@@ -44,7 +52,7 @@ def run_model_diagnostics(
     if not model_path.exists():
         raise ValueError(f"Model file does not exist: {model_path}")
 
-    checkpoint = torch.load(model_path, weights_only=False, map_location="cpu")
+    checkpoint = torch.load(model_path, weights_only=True, map_location="cpu")
     metadata = _json_dict(model_row["metadata_json"])
     model_config = checkpoint.get("config") or metadata.get("config") or {}
     feature_columns = checkpoint.get("feature_columns") or metadata.get("feature_columns")
@@ -173,6 +181,7 @@ def _write_plots(
     anomalous_indices: list[int],
     top_features: list[dict[str, Any]],
     output_dir: Path,
+    sampling_note: str | None = None,
 ) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     prefix = output_dir / f"model_{model_id}_dataset_{dataset_id}"
@@ -183,21 +192,30 @@ def _write_plots(
         "feature_heatmap": prefix.with_name(prefix.name + "_feature_heatmap.png"),
         "error_quantiles": prefix.with_name(prefix.name + "_error_quantiles.png"),
     }
-    _plot_error_histogram(errors, threshold, plot_paths["error_histogram"])
-    _plot_error_timeseries(errors, threshold, plot_paths["error_timeseries"])
-    _plot_top_features(top_features, plot_paths["top_features"])
+    _plot_error_histogram(errors, threshold, plot_paths["error_histogram"], sampling_note=sampling_note)
+    _plot_error_timeseries(errors, threshold, plot_paths["error_timeseries"], sampling_note=sampling_note)
+    _plot_top_features(top_features, plot_paths["top_features"], sampling_note=sampling_note)
     _plot_feature_heatmap(
         feature_columns=feature_columns,
         per_feature_errors=per_feature_errors,
         anomalous_indices=anomalous_indices,
         top_features=top_features,
         path=plot_paths["feature_heatmap"],
+        sampling_note=sampling_note,
     )
-    _plot_error_quantiles(errors, threshold, threshold_percentile, plot_paths["error_quantiles"])
+    _plot_error_quantiles(errors, threshold, threshold_percentile, plot_paths["error_quantiles"], sampling_note=sampling_note)
     return plot_paths
 
 
-def _plot_error_histogram(errors: list[float], threshold: float, path: Path) -> None:
+def _save_plot(fig, path: Path, sampling_note: str | None) -> None:
+    if sampling_note:
+        fig.suptitle(sampling_note, fontsize=9)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, metadata={"Description": sampling_note or "All scored windows"})
+    plt.close(fig)
+
+
+def _plot_error_histogram(errors: list[float], threshold: float, path: Path, *, sampling_note: str | None = None) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.hist(errors, bins=min(40, max(5, len(errors))), color="#4c78a8", edgecolor="white")
     ax.axvline(threshold, color="#d62728", linestyle="--", linewidth=2, label=f"threshold={threshold:.6g}")
@@ -208,12 +226,10 @@ def _plot_error_histogram(errors: list[float], threshold: float, path: Path) -> 
     ax.set_ylabel("Count of windows")
     ax.set_title("Reconstruction Error Distribution (x-axis capped at p99)")
     ax.legend()
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+    _save_plot(fig, path, sampling_note)
 
 
-def _plot_error_timeseries(errors: list[float], threshold: float, path: Path) -> None:
+def _plot_error_timeseries(errors: list[float], threshold: float, path: Path, *, sampling_note: str | None = None) -> None:
     indices = list(range(len(errors)))
     anomalous_indices = [index for index, error in enumerate(errors) if error > threshold]
     anomalous_errors = [errors[index] for index in anomalous_indices]
@@ -224,16 +240,14 @@ def _plot_error_timeseries(errors: list[float], threshold: float, path: Path) ->
     upper_limit = _robust_upper_limit(errors, percentile=99.0, minimum=threshold * 1.25)
     if upper_limit is not None:
         ax.set_ylim(bottom=0, top=upper_limit)
-    ax.set_xlabel("Window index")
+    ax.set_xlabel("Sample position (see sampling caption)" if sampling_note else "Window index")
     ax.set_ylabel("Reconstruction error")
     ax.set_title("Reconstruction Error Over Window Index (y-axis capped at p99)")
     ax.legend()
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+    _save_plot(fig, path, sampling_note)
 
 
-def _plot_top_features(top_features: list[dict[str, Any]], path: Path) -> None:
+def _plot_top_features(top_features: list[dict[str, Any]], path: Path, *, sampling_note: str | None = None) -> None:
     fig, ax = plt.subplots(figsize=(9, 5))
     if not top_features:
         ax.text(0.5, 0.5, "No windows above threshold", ha="center", va="center")
@@ -245,9 +259,7 @@ def _plot_top_features(top_features: list[dict[str, Any]], path: Path) -> None:
         ax.set_xlabel("Average per-feature reconstruction error")
         ax.set_ylabel("Feature")
         ax.set_title("Top Contributing Features Across Anomalous Windows")
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+    _save_plot(fig, path, sampling_note)
 
 
 def _plot_feature_heatmap(
@@ -257,6 +269,7 @@ def _plot_feature_heatmap(
     anomalous_indices: list[int],
     top_features: list[dict[str, Any]],
     path: Path,
+    sampling_note: str | None = None,
 ) -> None:
     fig, ax = plt.subplots(figsize=(10, 6))
     if not anomalous_indices or not top_features:
@@ -274,12 +287,10 @@ def _plot_feature_heatmap(
         ax.set_yticks(y_tick_positions)
         ax.set_yticklabels([str(anomalous_indices[index]) for index in y_tick_positions])
         ax.set_xlabel("Feature")
-        ax.set_ylabel("Anomalous window index")
+        ax.set_ylabel("Anomalous sample position (see sampling caption)" if sampling_note else "Anomalous window index")
         ax.set_title("Per-Feature Reconstruction Error Heatmap")
         fig.colorbar(image, ax=ax, label="Per-feature reconstruction error")
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+    _save_plot(fig, path, sampling_note)
 
 
 def _sample_tick_positions(length: int, *, max_ticks: int) -> list[int]:
@@ -318,6 +329,7 @@ def _plot_error_quantiles(
     threshold: float,
     threshold_percentile: float | None,
     path: Path,
+    *, sampling_note: str | None = None,
 ) -> None:
     sorted_errors = sorted(errors)
     if len(sorted_errors) == 1:
@@ -342,9 +354,7 @@ def _plot_error_quantiles(
     ax.set_ylabel("Reconstruction error")
     ax.set_title("Reconstruction Error Quantiles (y-axis capped at p99)")
     ax.legend()
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+    _save_plot(fig, path, sampling_note)
 
 
 def _log_summary(logger, summary: dict[str, Any]) -> None:

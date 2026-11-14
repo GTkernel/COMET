@@ -1,5 +1,5 @@
 # config/generated
 
-COMET writes generated feature configuration files here after profiling a dataset.
+Profiling writes editable feature YAML here for SQLite and Parquet datasets.
 
-If a generated feature config needs changes, edit the generated YAML and pass it to `prepare` with `--feature-config path/to/file.yaml`.
+Edit the column roles, then pass the file to `prepare --feature-config path/to/file.yaml`. To change timestamp identity, alignment or annotation storage, update the import manifest and reimport.
