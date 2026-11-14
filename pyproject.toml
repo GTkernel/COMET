@@ -1,25 +1,30 @@
 [project]
 name = "comet"
-version = "0.1.0"
+version = "0.2.0"
 description = "Proof-of-concept CLI scaffold for satellite telemetry anomaly detection and RAG-assisted diagnosis."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "pandas",
-    "numpy",
-    "pyyaml",
-    "torch",
-    "sqlalchemy",
-    "llama-index",
-    "chromadb",
-    "pypdf",
-    "matplotlib",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "pyyaml>=6",
+    "pyarrow>=15",
+    "duckdb>=1.1",
+    "ijson>=3.2",
 ]
 
 [project.optional-dependencies]
+modeling = ["torch>=2.2", "matplotlib>=3.8"]
+esa = ["pandas>=2.2", "zipfile-inflate64>=0.1"]
+reference = ["pandas>=2.2", "scikit-learn>=1.4", "portion>=2.4,<3"]
+rag = ["chromadb", "pypdf"]
 dev = [
     "pytest",
+    "psutil",
 ]
+
+[project.scripts]
+comet = "src.cli.__main__:main"
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -1,8 +1,5 @@
 # src/profiling
 
-Dataset profiling code.
+`dataset_profile.py` dispatches profiling by storage type. Canonical Parquet datasets use bounded descriptive statistics and retain feature roles from their manifest.
 
-Overview:
-- `dataset_profile.py`: inspects ingested telemetry columns and writes a feature config under `config/generated/`
-
-Edit the generated feature config when you need to change which columns are used for modeling or context.
+Profiling writes editable feature YAML under `config/generated/` for SQLite and Parquet datasets. Pass it to `prepare --feature-config PATH` after changing modeling or context roles. Changes to source mappings require an updated manifest and a new import.

@@ -1,9 +1,12 @@
-.venv/
+.venv*/
 venv/
 
 __pycache__/
 *.pyc
 .pytest_cache/
+pytest-cache-files-*/
+tmp-esa-processed/
+_tmp_subagent/
 *.egg-info/
 
 logs/*.log
@@ -22,7 +25,16 @@ figures/
 data/*
 !data/README.md
 !diagnostics/README.md
-tests/
+datasets/
+scratch/
+preparations/
+runs/
+monitoring/
+runtime-data/
+*.mmap
+*.npy
+*.parquet
+!tests/fixtures/*.parquet
 
 # remove generated config files
 config/generated/*.yaml

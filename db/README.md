@@ -1,5 +1,5 @@
 # db
 
-COMET writes `satellite_operator.db` in this directory by default.
+The default SQLite catalog is `satellite_operator.db` in this directory.
 
-Delete the database file if you want to start a fresh local run.
+Use another storage root or `--db` path for a fresh catalog. An existing catalog holds dataset/model IDs and historical results, so back it up with its referenced artifacts before replacing it.

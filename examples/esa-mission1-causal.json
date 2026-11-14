@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "esa": {
+    "mission": 1,
+    "version": "2",
+    "profile": "causal",
+    "trusted_pickle": true
+  }
+}

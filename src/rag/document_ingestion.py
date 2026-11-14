@@ -44,7 +44,11 @@ def ingest_documents(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     db_path: str | Path | None = None,
+    semantic: bool = False,
 ) -> dict[str, Any]:
+    if semantic:
+        from src.rag.semantic import ingest_semantic
+        return ingest_semantic(documents_dir, vector_store_dir, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive.")
     if chunk_overlap < 0:
@@ -290,12 +294,6 @@ class _VectorStore:
             "\n".join(json.dumps(record, sort_keys=True) for record in existing),
             encoding="utf-8",
         )
-
-    def has_documents(self) -> bool:
-        if self.collection is not None:
-            return self.collection.count() > 0
-        fallback_path = self.persist_dir / "mission_documents.jsonl"
-        return fallback_path.exists() and bool(fallback_path.read_text(encoding="utf-8").strip())
 
     def query(self, query_text: str, top_k: int) -> list[dict[str, Any]]:
         if top_k <= 0:

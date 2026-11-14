@@ -1,22 +1,26 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
-# I should probably put this in .env file
+# Runtime artifacts can live outside the source checkout.
 V2_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = V2_ROOT / "data"
-DB_DIR = V2_ROOT / "db"
+STORAGE_ROOT = Path(os.environ.get("COMET_STORAGE_DIR", V2_ROOT)).expanduser().resolve()
+DATA_DIR = STORAGE_ROOT / "data"
+DB_DIR = STORAGE_ROOT / "db"
 DB_PATH = DB_DIR / "satellite_operator.db"
-MODELS_DIR = V2_ROOT / "models"
+MODELS_DIR = STORAGE_ROOT / "models"
 CONFIG_DIR = V2_ROOT / "config"
-GENERATED_CONFIG_DIR = CONFIG_DIR / "generated"
+GENERATED_CONFIG_DIR = STORAGE_ROOT / "config" / "generated"
 MODEL_CONFIG_DIR = CONFIG_DIR / "model_configs"
-RAG_DIR = V2_ROOT / "rag"
+RAG_DIR = STORAGE_ROOT / "rag"
 RAG_DOCS_DIR = RAG_DIR / "documents"
 RAG_VECTOR_DIR = RAG_DIR / "vector_store"
-LOGS_DIR = V2_ROOT / "logs"
-DIAGNOSTICS_DIR = V2_ROOT / "diagnostics"
-EVALUATION_DIR = V2_ROOT / "evaluation"
+LOGS_DIR = STORAGE_ROOT / "logs"
+DIAGNOSTICS_DIR = STORAGE_ROOT / "diagnostics"
+EVALUATION_DIR = STORAGE_ROOT / "evaluation"
+DATASETS_DIR = STORAGE_ROOT / "datasets"
+SCRATCH_DIR = Path(os.environ.get("COMET_SCRATCH_DIR", STORAGE_ROOT / "scratch")).expanduser().resolve()
 
 
 def ensure_base_directories() -> None:
@@ -31,5 +35,7 @@ def ensure_base_directories() -> None:
         LOGS_DIR,
         DIAGNOSTICS_DIR,
         EVALUATION_DIR,
+        DATASETS_DIR,
+        SCRATCH_DIR,
     ]:
         p.mkdir(parents=True, exist_ok=True)

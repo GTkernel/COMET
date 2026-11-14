@@ -1,0 +1,6 @@
+# Candidate for wide ESA telemetry with extreme standardized channel values.
+# All remaining settings inherit the pipeline defaults. Retraining is required.
+numeric_transform: asinh
+
+# Train on non-overlapping 60-row windows; detection still scores every window.
+stride: 60

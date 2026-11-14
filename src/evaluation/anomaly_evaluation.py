@@ -4,6 +4,7 @@ import ast
 import csv
 import json
 import statistics
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -17,7 +18,7 @@ import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 
 from src.common.paths import EVALUATION_DIR
-from src.db import get_connection, get_dataset, get_model, init_db
+from src.db import get_connection, get_dataset, get_model, get_detection_run, init_db
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ def evaluate_anomalies(
     *,
     db_path: str | Path | None = None,
     output_dir: str | Path = EVALUATION_DIR,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Compare detected anomaly windows against labeled anomaly intervals."""
     init_db(db_path)
@@ -60,13 +62,25 @@ def evaluate_anomalies(
     model = get_model(model_id, db_path=db_path)
     if model is None:
         raise ValueError(f"Model {model_id} does not exist.")
-    if int(model["dataset_id"]) != dataset_id:
+    modern = json.loads(model["metadata_json"] or "{}").get("pipeline_version") == 2
+    if not modern and int(model["dataset_id"]) != dataset_id:
         raise ValueError(f"Model {model_id} was trained for dataset {model['dataset_id']}, not {dataset_id}.")
+    latest_run = get_detection_run(run_id, dataset_id=dataset_id, model_id=model_id, db_path=db_path)
+    if modern or run_id:
+        if latest_run is None:
+            raise ValueError("Evaluation requires a completed run for this target dataset and model.")
+        run_id = latest_run["run_id"]
+        output_dir = Path(output_dir) / run_id
+    elif latest_run is not None:
+        run_id = latest_run["run_id"]
+        output_dir = Path(output_dir) / run_id
 
     ground_truth = load_ground_truth_intervals(metadata_file)
-    detections = load_detected_anomalies(dataset_id, model_id, db_path=db_path)
+    detections = load_detected_anomalies(dataset_id, model_id, run_id=run_id, db_path=db_path)
     matches = _match_intervals(ground_truth, detections)
     summary = _build_summary(dataset_id, model_id, metadata_file, ground_truth, detections, matches)
+    summary.update(metric="legacy-overlap", run_id=run_id,
+                   benchmark_note="COMET interval-overlap evaluation; not ESA benchmark performance.")
     plot_paths = _write_plots(
         dataset_id=dataset_id,
         model_id=model_id,
@@ -116,23 +130,33 @@ def load_detected_anomalies(
     model_id: int,
     *,
     db_path: str | Path | None = None,
+    run_id: str | None = None,
 ) -> list[DetectedAnomaly]:
+    from src.db import get_detection_run
+    run = get_detection_run(run_id, dataset_id=dataset_id, model_id=model_id, db_path=db_path)
+    if run_id is not None and run is None:
+        raise ValueError("No matching completed detection run.")
+    if run is not None:
+        run_id = run["run_id"]
+    run_filter = "AND run_id = ?" if run_id else "AND run_id IS NULL"
+    parameters = (dataset_id, model_id, run_id) if run_id else (dataset_id, model_id)
     with get_connection(db_path) as conn:
         rows = conn.execute(
-            """
-            SELECT anomaly_id, start_timestamp, end_timestamp, anomaly_score, threshold, window_index
+            f"""
+            SELECT anomaly_id, start_timestamp, end_timestamp, score_timestamp, anomaly_score, threshold, window_index
             FROM anomalies
             WHERE dataset_id = ? AND model_id = ?
+            {run_filter}
             ORDER BY window_index
             """,
-            (dataset_id, model_id),
+            parameters,
         ).fetchall()
 
     detections = []
     for row in rows:
         if row["start_timestamp"] is None or row["end_timestamp"] is None:
             continue
-        start = _parse_timestamp(row["start_timestamp"])
+        start = _parse_timestamp(row["score_timestamp"] or row["start_timestamp"])
         end = _parse_timestamp(row["end_timestamp"])
         if end < start:
             start, end = end, start
@@ -205,9 +229,10 @@ def _build_summary(
     total_detections = len(detections)
     matched_gt = len(matches["matched_gt"])
     total_gt = len(ground_truth)
-    precision = matched_detections / total_detections if total_detections else 0.0
-    recall = matched_gt / total_gt if total_gt else 0.0
-    f1 = (2 * precision * recall / (precision + recall)) if precision + recall else 0.0
+    precision = matched_detections / total_detections if total_detections else None
+    recall = matched_gt / total_gt if total_gt else None
+    f1 = None if precision is None or recall is None else (
+        (2 * precision * recall / (precision + recall)) if precision + recall else 0.0)
     delay_values = [item["delay_seconds"] for item in matches["delays"]]
 
     return {
@@ -223,6 +248,7 @@ def _build_summary(
         "precision": precision,
         "recall": recall,
         "f1": f1,
+        "undefined_metrics": [name for name, value in (("precision", precision), ("recall", recall), ("f1", f1)) if value is None],
         "mean_detection_delay_seconds": statistics.fmean(delay_values) if delay_values else None,
         "median_detection_delay_seconds": statistics.median(delay_values) if delay_values else None,
         "matched_ground_truth_indices": sorted(matches["matched_gt"]),
@@ -519,11 +545,7 @@ def _plot_bar(
 
 
 def _count_by(values: list[str]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for value in values:
-        counts[value] = counts.get(value, 0) + 1
-    return dict(sorted(counts.items(), key=lambda item: _category_sort_key(item[0])))
-
+    return dict(sorted(Counter(values).items(), key=lambda item: _category_sort_key(item[0])))
 
 def _category_sort_key(value: str) -> tuple[int, int | str]:
     try:

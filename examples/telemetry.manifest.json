@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "format": "auto",
+  "layout": "wide",
+  "timestamp": "timestamp",
+  "timezone": "UTC",
+  "entity_columns": ["satellite_id"],
+  "numeric_features": ["temperature", "voltage"],
+  "categorical_features": ["mode"],
+  "context_columns": ["operator_note"],
+  "label_columns": ["is_anomaly"],
+  "units": {"temperature": "degC", "voltage": "V"},
+  "cadence_seconds": 30,
+  "max_gap_seconds": 300,
+  "duplicate_policy": "error",
+  "splits": {"fractions": [0.7, 0.15, 0.15]}
+}

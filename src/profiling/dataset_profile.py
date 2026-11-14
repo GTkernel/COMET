@@ -7,10 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-try:
-    import yaml
-except ModuleNotFoundError:  # pragma: no cover - exercised only when PyYAML is unavailable.
-    yaml = None
+import yaml
 
 from src.common.paths import GENERATED_CONFIG_DIR
 from src.db import get_connection, get_dataset, init_db, insert_feature_config, table_exists, utc_now
@@ -58,6 +55,24 @@ def profile_dataset(
     if dataset is None:
         raise ValueError(f"Dataset {dataset_id} does not exist.")
 
+    if json.loads(dataset["metadata_json"] or "{}").get("storage_version") == 2:
+        from src.ingestion.store import profile_dataset as profile_canonical, load_dataset
+        result = profile_canonical(dataset_id, db_path=db_path)
+        canonical = load_dataset(dataset_id, db_path=db_path)
+        path = Path(generated_config_dir) / f"feature_config_dataset_{dataset_id}.yaml"
+        overrides = _load_user_overrides(path)
+        aliases = {"numeric": "numeric_telemetry_feature", "categorical": "categorical_feature"}
+        columns = [] if canonical["manifest"].get("ordering") == "row" else [
+            {"column_name": "timestamp", "sanitized_name": "timestamp", "role": "timestamp"}]
+        columns.extend({"column_name": c["source_name"], "sanitized_name": c["name"],
+                        "role": overrides.get(c["name"], aliases.get(c["role"], c["role"]))}
+                       for c in canonical["columns"])
+        config = {"dataset_id": dataset_id, "version": "2", "columns": columns}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        insert_feature_config(dataset_id, path, config, version="2", db_path=db_path)
+        return {**result, "column_count": len(columns), "config_path": str(path), "feature_config_path": str(path)}
+
     raw_table = f"raw_dataset_{dataset_id}"
     with get_connection(db_path) as conn:
         if not table_exists(conn, raw_table):
@@ -93,7 +108,7 @@ def profile_dataset(
     feature_config = _build_feature_config(dataset_id, raw_table, profiles)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with config_path.open("w", encoding="utf-8") as file:
-        _safe_dump_yaml(feature_config, file)
+        yaml.safe_dump(feature_config, file, sort_keys=False)
 
     insert_feature_config(
         dataset_id,
@@ -479,7 +494,7 @@ def _load_user_overrides(config_path: Path) -> dict[str, str]:
     if not config_path.exists():
         return {}
     with config_path.open("r", encoding="utf-8") as file:
-        parsed = _safe_load_yaml(file.read())
+        parsed = yaml.safe_load(file) or {}
     overrides: dict[str, str] = {}
 
     for column_name, role in (parsed.get("overrides") or {}).items():
@@ -496,75 +511,6 @@ def _load_user_overrides(config_path: Path) -> dict[str, str]:
                     overrides[str(column[key])] = str(override_role)
 
     return overrides
-
-
-def _safe_load_yaml(text: str) -> dict[str, Any]:
-    """Load YAML with PyYAML when available, falling back to the limited override parser."""
-    if yaml is not None:
-        return yaml.safe_load(text) or {}
-
-    parsed: dict[str, Any] = {}
-    current_section: str | None = None
-    for line in text.splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        if not line.startswith(" ") and line.endswith(":"):
-            current_section = line[:-1].strip()
-            parsed[current_section] = {}
-            continue
-        if current_section == "overrides" and line.startswith("  ") and ":" in line:
-            key, value = line.strip().split(":", 1)
-            parsed["overrides"][key.strip()] = value.strip().strip("'\"")
-    return parsed
-
-
-def _safe_dump_yaml(data: dict[str, Any], file) -> None:
-    """Write YAML with PyYAML when available, otherwise use the simple local dumper."""
-    if yaml is not None:
-        yaml.safe_dump(data, file, sort_keys=False)
-        return
-    file.write(_to_simple_yaml(data))
-
-
-def _to_simple_yaml(value: Any, indent: int = 0) -> str:
-    """Serialize basic dictionaries, lists, and scalars to a minimal YAML string."""
-    spaces = " " * indent
-    if isinstance(value, dict):
-        lines: list[str] = []
-        for key, item in value.items():
-            if isinstance(item, (dict, list)):
-                lines.append(f"{spaces}{key}:")
-                lines.append(_to_simple_yaml(item, indent + 2).rstrip())
-            else:
-                lines.append(f"{spaces}{key}: {_format_yaml_scalar(item)}")
-        return "\n".join(lines) + "\n"
-    if isinstance(value, list):
-        lines = []
-        for item in value:
-            if isinstance(item, dict):
-                lines.append(f"{spaces}-")
-                lines.append(_to_simple_yaml(item, indent + 2).rstrip())
-            elif isinstance(item, list):
-                lines.append(f"{spaces}-")
-                lines.append(_to_simple_yaml(item, indent + 2).rstrip())
-            else:
-                lines.append(f"{spaces}- {_format_yaml_scalar(item)}")
-        return "\n".join(lines) + "\n"
-    return f"{spaces}{_format_yaml_scalar(value)}\n"
-
-
-def _format_yaml_scalar(value: Any) -> str:
-    """Format one scalar value safely for the minimal YAML writer."""
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return str(value)
-    text = str(value)
-    if not text or any(char in text for char in [":", "#", "{", "}", "[", "]", ","]) or text != text.strip():
-        return json.dumps(text)
-    return text
 
 
 def _quote_identifier(identifier: str) -> str:

@@ -1,5 +1,2 @@
-PyYAML
-torch
-matplotlib
-chromadb
-pypdf
+# See pyproject.toml for core and optional dependency groups.
+-e .[modeling,esa,rag]

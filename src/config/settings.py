@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -33,12 +34,12 @@ DEFAULTS: dict[str, Any] = {
 def load_app_config(path: Path | None = None) -> dict[str, Any]:
     config_path = path or (CONFIG_DIR / "app_config.json")
     if not config_path.exists():
-        return DEFAULTS.copy()
+        return deepcopy(DEFAULTS)
 
     with config_path.open("r", encoding="utf-8") as f:
         parsed = json.load(f)
 
-    merged = DEFAULTS.copy()
+    merged = deepcopy(DEFAULTS)
     for key, value in parsed.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = {**merged[key], **value}

@@ -25,8 +25,16 @@ def _prepare_db_path(db_path: str | Path | None) -> str:
     return str(path)
 
 
+class _CatalogConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(_prepare_db_path(db_path))
+    conn = sqlite3.connect(_prepare_db_path(db_path), factory=_CatalogConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -34,6 +42,8 @@ def get_connection(db_path: str | Path | None = None) -> sqlite3.Connection:
 
 def init_db(db_path: str | Path | None = None) -> None:
     with get_connection(db_path) as conn:
+        if conn.execute("PRAGMA user_version").fetchone()[0] > 1:
+            raise ValueError("This database was created by a newer COMET version.")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS datasets (
@@ -166,6 +176,53 @@ def init_db(db_path: str | Path | None = None) -> None:
             """
         )
         conn.commit()
+        _migrate_catalog(conn)
+
+
+def _migrate_catalog(conn: sqlite3.Connection) -> None:
+    """Add versioned run provenance without rewriting historical data or IDs."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version == 0:
+            conn.execute("""CREATE TABLE IF NOT EXISTS preparations (
+                preparation_id TEXT PRIMARY KEY, dataset_id INTEGER NOT NULL,
+                artifact_dir TEXT NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL, created_at TEXT NOT NULL,
+                FOREIGN KEY(dataset_id) REFERENCES datasets(dataset_id))""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS detection_runs (
+                run_id TEXT PRIMARY KEY, dataset_id INTEGER NOT NULL, model_id INTEGER NOT NULL,
+                status TEXT NOT NULL, artifact_dir TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY(dataset_id) REFERENCES datasets(dataset_id),
+                FOREIGN KEY(model_id) REFERENCES models(model_id))""")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(anomalies)")}
+            if "run_id" not in columns:
+                conn.execute("ALTER TABLE anomalies ADD COLUMN run_id TEXT REFERENCES detection_runs(run_id)")
+            if "score_timestamp" not in columns:
+                conn.execute("ALTER TABLE anomalies ADD COLUMN score_timestamp TEXT")
+            conn.execute("CREATE INDEX IF NOT EXISTS anomalies_run_idx ON anomalies(run_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS detection_runs_target_idx ON detection_runs(dataset_id,model_id,status)")
+            conn.execute("PRAGMA user_version=1")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def get_detection_run(run_id: str | None = None, *, dataset_id: int | None = None,
+                      model_id: int | None = None, db_path=None) -> dict[str, Any] | None:
+    """Find a completed run so reports exclude partial results."""
+    clauses, params = ["status = 'completed'"], []
+    for column, value in (("run_id", run_id), ("dataset_id", dataset_id), ("model_id", model_id)):
+        if value is not None:
+            clauses.append(column + " = ?")
+            params.append(value)
+    with get_connection(db_path) as conn:
+        row = conn.execute("SELECT * FROM detection_runs WHERE " + " AND ".join(clauses)
+                           + " ORDER BY created_at DESC, rowid DESC LIMIT 1", params).fetchone()
+    return dict(row) if row else None
 
 
 def insert_dataset(
@@ -200,93 +257,11 @@ def insert_dataset(
         return int(cursor.lastrowid)
 
 
-def insert_dataset_file(
-    dataset_id: int,
-    file_path: str | Path,
-    *,
-    file_size: int | None = None,
-    modified_time: str | None = None,
-    content_hash: str | None = None,
-    row_count: int | None = None,
-    status: str = "registered",
-    db_path: str | Path | None = None,
-) -> int:
-    path = Path(file_path)
-    with get_connection(db_path) as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO dataset_files (
-                dataset_id, file_name, file_path, file_size, modified_time,
-                content_hash, row_count, status, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                dataset_id,
-                path.name,
-                str(path),
-                file_size,
-                modified_time,
-                content_hash,
-                row_count,
-                status,
-                utc_now(),
-            ),
-        )
-        conn.commit()
-        return int(cursor.lastrowid)
-
-
-def update_dataset_row_count(
-    dataset_id: int,
-    row_count: int,
-    *,
-    status: str = "ingested",
-    db_path: str | Path | None = None,
-) -> None:
-    with get_connection(db_path) as conn:
-        conn.execute(
-            """
-            UPDATE datasets
-            SET row_count = ?, status = ?, updated_at = ?
-            WHERE dataset_id = ?
-            """,
-            (row_count, status, utc_now(), dataset_id),
-        )
-        conn.commit()
-
-
 def get_dataset(dataset_id: int, db_path: str | Path | None = None) -> dict[str, Any] | None:
     with get_connection(db_path) as conn:
         row = conn.execute(
             "SELECT * FROM datasets WHERE dataset_id = ?",
             (dataset_id,),
-        ).fetchone()
-
-    return dict(row) if row is not None else None
-
-
-def get_duplicate_dataset_file(
-    *,
-    file_name: str,
-    file_path: str,
-    file_size: int,
-    modified_time: str,
-    content_hash: str,
-    db_path: str | Path | None = None,
-) -> dict[str, Any] | None:
-    with get_connection(db_path) as conn:
-        row = conn.execute(
-            """
-            SELECT *
-            FROM dataset_files
-            WHERE file_name = ?
-              AND file_path = ?
-              AND file_size = ?
-              AND modified_time = ?
-              AND content_hash = ?
-            """,
-            (file_name, file_path, file_size, modified_time, content_hash),
         ).fetchone()
 
     return dict(row) if row is not None else None
@@ -476,3 +451,85 @@ def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
         (table_name,),
     ).fetchone()
     return row is not None
+
+
+def insert_dataset_file(
+    dataset_id: int,
+    file_path: str | Path,
+    *,
+    file_size: int | None = None,
+    modified_time: str | None = None,
+    content_hash: str | None = None,
+    row_count: int | None = None,
+    status: str = "registered",
+    db_path: str | Path | None = None,
+) -> int:
+    path = Path(file_path)
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO dataset_files (
+                dataset_id, file_name, file_path, file_size, modified_time,
+                content_hash, row_count, status, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                dataset_id,
+                path.name,
+                str(path),
+                file_size,
+                modified_time,
+                content_hash,
+                row_count,
+                status,
+                utc_now(),
+            ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
+def update_dataset_row_count(
+    dataset_id: int,
+    row_count: int,
+    *,
+    status: str = "ingested",
+    db_path: str | Path | None = None,
+) -> None:
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE datasets
+            SET row_count = ?, status = ?, updated_at = ?
+            WHERE dataset_id = ?
+            """,
+            (row_count, status, utc_now(), dataset_id),
+        )
+        conn.commit()
+
+
+def get_duplicate_dataset_file(
+    *,
+    file_name: str,
+    file_path: str,
+    file_size: int,
+    modified_time: str,
+    content_hash: str,
+    db_path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM dataset_files
+            WHERE file_name = ?
+              AND file_path = ?
+              AND file_size = ?
+              AND modified_time = ?
+              AND content_hash = ?
+            """,
+            (file_name, file_path, file_size, modified_time, content_hash),
+        ).fetchone()
+
+    return dict(row) if row is not None else None
